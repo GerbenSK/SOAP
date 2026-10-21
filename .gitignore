@@ -19,8 +19,6 @@ documentation/property_table.rst
 
 SOAP/property_calculation/deprecated/
 
-parameter_files/COLIBRE_THERMAL_LG.yml
-
 tests/FLAMINGO/test_parameters.yml
 tests/COLIBRE/test_parameters.yml
 tests/Before_vic/
