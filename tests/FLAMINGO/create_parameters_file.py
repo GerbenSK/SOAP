@@ -12,7 +12,7 @@ import yaml
 with open(sys.argv[1], 'r') as file:
     test_params = yaml.safe_load(file)
 
-with open('parameter_files/FLAMINGO.yml', 'r') as file:
+with open('parameter_files/MINIMAL_FLAMINGO_Gerben.yml', 'r') as file:
     run_params = yaml.safe_load(file)
 
 for k in run_params:

@@ -17,9 +17,19 @@ documentation/variations_table.tex
 documentation/units.tex
 documentation/property_table.rst
 
+SOAP/property_calculation/deprecated/
+
+parameter_files/COLIBRE_THERMAL_LG.yml
+
 tests/FLAMINGO/test_parameters.yml
 tests/COLIBRE/test_parameters.yml
+tests/Before_vic/
 tests/test_SO_radius_*.png
 test_data/*
 test_output/
 test_SO_radius*png
+
+venv/
+plotting/
+plotting_requirements.txt
+create_venv.sh

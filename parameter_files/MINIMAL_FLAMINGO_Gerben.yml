@@ -1,0 +1,84 @@
+# Values in this section are substituted into the other sections
+# The simulation name (box size and resolution) and snapshot will be appended
+# to these to get the full name of the input/output files/directories
+Parameters:
+  sim_dir: /net/hypernova/data2/student_projects/stemker/swift/source/examples/FLAMINGO
+  output_dir: /net/hypernova/data2/student_projects/stemker/swift/source/examples/FLAMINGO
+  scratch_dir: /net/hypernova/data2/student_projects/stemker/swift/source/examples/FLAMINGO
+  
+
+# Location of the Swift snapshots:
+Snapshots:
+  # Use {snap_nr:04d} for the snapshot number and {file_nr} for the file number.
+  filename: "{sim_dir}/{sim_name}/flamingo_{snap_nr:04d}.hdf5"
+
+# Which halo finder we're using, and base name for halo finder output files
+HaloFinder:
+  type: HBTplus
+  filename: "{sim_dir}/{sim_name}/hbt_output_sorted/OrderedSubSnap_{snap_nr:03d}.hdf5"
+  fof_filename: "{sim_dir}/{sim_name}/fof_output_{snap_nr:04d}.hdf5"
+
+GroupMembership:
+  # Where to write the group membership files
+  filename: "{output_dir}/{sim_name}/SOAP_uncompressed/{halo_finder}/membership_{snap_nr:04d}/membership_{snap_nr:04d}.hdf5"
+
+HaloProperties:
+  # Where to write the halo properties file
+  filename: "{output_dir}/{sim_name}/SOAP_uncompressed/{halo_finder}/halo_properties_{snap_nr:04d}.hdf5"
+  # Where to write temporary chunk output
+  chunk_dir: "{scratch_dir}/{sim_name}/SOAP-tmp/{halo_finder}/"
+
+ApertureProperties:
+  properties:
+    {}
+  variations:
+    {}
+ProjectedApertureProperties:
+  properties:
+    {}
+  variations:
+    {}
+SOProperties:
+  properties:
+    CentreOfMass: true
+    CentreOfMassVelocity: true
+    Concentration: true
+    ConcentrationUnsoftened: true
+    MassFractionSatellites: true
+    MassFractionExternal: true
+    MaximumCircularVelocity: true
+    MaximumCircularVelocityRadius: true
+    NumberOfDarkMatterParticles: true
+    SORadius: true
+    SpinParameter: true
+    TotalMass: true
+  variations:
+    200_crit:
+      type: crit
+      value: 200.0
+    200_mean:
+      type: mean
+      value: 200.0
+    500_crit:
+      type: crit
+      value: 500.0
+SubhaloProperties:
+  properties:
+    CentreOfMass: true
+    CentreOfMassVelocity: true
+    EncloseRadius: true
+    NumberOfDarkMatterParticles: true
+    NumberOfGasParticles: true
+    NumberOfStarParticles: true
+    NumberOfBlackHoleParticles: true
+    MaximumCircularVelocity: true
+    MaximumCircularVelocityUnsoftened: true
+    MaximumCircularVelocityRadiusUnsoftened: true
+    SpinParameter: true
+    TotalMass: true
+calculations:
+  calculate_missing_properties: false
+  min_read_radius_cmpc: 5
+  recently_heated_gas_filter:
+    delta_time_myr: 15
+    use_AGN_delta_T: true

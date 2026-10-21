@@ -10,7 +10,7 @@ import yaml
 with open('tests/COLIBRE/parameters.yml', 'r') as file:
     test_params = yaml.safe_load(file)
 
-with open('parameter_files/COLIBRE_THERMAL.yml', 'r') as file:
+with open('parameter_files/COLIBRE_THERMAL_LG.yml', 'r') as file:
     run_params = yaml.safe_load(file)
 
 for k in run_params:

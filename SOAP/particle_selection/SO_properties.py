@@ -40,8 +40,9 @@ from SOAP.property_calculation.kinematic_properties import (
 from SOAP.property_calculation.euler_mass_terms import (
     get_radial_bins,
     get_angular_bins,
-    get_sph_quantities_with_grad,
+    get_sph_quantities_with_gradient,
     get_integrand_thermal_support,
+    get_integrand_turbulent_support,
     get_integrand_rotational_support,
     get_integrand_streaming_support,
     do_surface_integral)
@@ -736,6 +737,13 @@ class SOParticleData:
         Pressure of gas particles.
         """
         return self.get_dataset("PartType0/Pressures")[self.gas_selection]
+
+    @lazy_property
+    def gas_vel_dispersion(self) -> unyt.unyt_array:
+        """
+        One-dimensinal squared velocity dispersion of gas particles.
+        """
+        return self.get_dataset("PartType0/VelocityDispersions")[self.gas_selection]
 
     @lazy_property
     def Mgas(self) -> unyt.unyt_quantity:
@@ -1485,7 +1493,7 @@ class SOParticleData:
         return (self.gas_temperatures * self.gas_mass_fraction).sum()
 
     @lazy_property
-    def gas_no_cool(self) -> NDArray[bool]:
+    def gas_no_cool(self) -> NDArray[bool]: # type: ignore
         """
         Mask for non-cool gas particles (i.e. temperature > 1.e5 K).
         """
@@ -1830,7 +1838,7 @@ class SOParticleData:
         return self.gas_compY.sum().value * self.compY_unit
 
     @lazy_property
-    def gas_no_agn(self) -> NDArray[bool]:
+    def gas_no_agn(self) -> NDArray[bool]: # type: ignore
         """
         Mask for gas particles that were not recently heated by AGN feedback.
 
@@ -1922,7 +1930,7 @@ class SOParticleData:
             ).sum()
 
     @lazy_property
-    def gas_no_cool_no_agn(self) -> NDArray[bool]:
+    def gas_no_cool_no_agn(self) -> NDArray[bool]: # type: ignore
         """
         Mask for gas particles that are not cold (temperature > 1.e5 K) and that
         were not recently heated by AGN feedback.
@@ -3239,9 +3247,9 @@ class SOParticleData:
     def _calculate_euler_mass_terms(
         self,
         inner_radius=0.01,
-        outer_radius=1.0,
-        number_radial_bins=2,
-        number_angular_bins=12,
+        outer_radius=1.2,
+        number_radial_bins=300,
+        number_angular_bins=12*5**2,
     ):
         """
         Returns the values of all the Euler mass terms for a halo as a function of
@@ -3258,7 +3266,7 @@ class SOParticleData:
         number_radial_bins: int
             Number of radial shells to use.
         number_angular_bins: int
-            Number of angular bins to use. Needs to be in the form of 12 * 2**alpha
+            Number of angular bins to use. Needs to be in the form of 12 * nside**2
             because we are using healpix.
 
         Returns
@@ -3327,6 +3335,9 @@ class SOParticleData:
             unyt.kg * unyt.Mpc ** (-1) * unyt.s ** (-2)
         )
         gas_densities = self.gas_densities.to(unyt.Msun * unyt.Mpc ** (-3))
+        gas_turbulence = (gas_densities * self.gas_vel_dispersion).to( # Velocity dispersions are already squared
+            unyt.kg * unyt.Mpc ** (-1) * unyt.s ** (-2)
+        )
 
         #===========================================================================
         # Do SPH-smoothing for quantities relevant to the EM-terms.
@@ -3337,8 +3348,8 @@ class SOParticleData:
 
         # Pack together all required gas properties we need to smooth.
         properties_to_smooth = (
-            gas_densities,
             gas_pressures,
+            gas_turbulence,
             gas_spherical_velocities[0],
             gas_spherical_velocities[1],
             gas_spherical_velocities[2],
@@ -3349,17 +3360,20 @@ class SOParticleData:
         )
 
         # Smooth quantities, which will return the results as (N_query, N_quantities) shape.
-        smoothed_values, smoothed_spherical_gradients = get_sph_quantities_with_grad(
+        smoothed_densities, smoothed_values, smoothed_spherical_gradients = get_sph_quantities_with_gradient(
             gas_tree,
             gas_coordinates,
-            gas_masses,
-            properties_to_smooth,
-            gas_smoothing_lengths,
             gas_densities,
+            gas_masses,
+            gas_smoothing_lengths,
+            properties_to_smooth,
             all_query_points,
         )
 
         # Reshape to get back to the original radial decomposition shape.
+        smoothed_densities = smoothed_densities.reshape(
+            number_radial_bins, number_angular_bins
+        )
         smoothed_values = smoothed_values.reshape(
             number_radial_bins, number_angular_bins, number_of_quantities
         )
@@ -3368,7 +3382,8 @@ class SOParticleData:
         )
 
         # Add back the units, which are lost within jit.
-        smoothed_densities = smoothed_values[:, :, 0] * gas_densities.units
+        smoothed_densities *= gas_densities.units
+        smoothed_pressures = smoothed_values[:, :, 0] * gas_pressures.units
         smoothed_vr = smoothed_values[:, :, 2] * gas_spherical_velocities[0].units
         smoothed_vtheta = smoothed_values[:, :, 3] * gas_spherical_velocities[1].units
         smoothed_vphi = smoothed_values[:, :, 4] * gas_spherical_velocities[2].units
@@ -3376,8 +3391,13 @@ class SOParticleData:
         # The angular derivatives already include 1/R and 1/Rsin(theta) hence we only
         # need units for the radial dimension.
         smoothed_dP_dr = (
-            smoothed_spherical_gradients[:, :, 1, 0]
+            smoothed_spherical_gradients[:, :, 0, 0]
             * gas_pressures.units
+            / radial_bin_centres.units
+        )
+        smoothed_dTurbulence_dr = (
+            smoothed_spherical_gradients[:, :, 1, 0]
+            * gas_turbulence.units
             / radial_bin_centres.units
         )
         smoothed_dvr_dr = (
@@ -3401,35 +3421,71 @@ class SOParticleData:
         #===========================================================================
         R = radial_bin_centres[:, None]
 
-        integrand_thermal = get_integrand_thermal_support(
-            smoothed_dP_dr, smoothed_densities
-        )
-        integrand_rotation = get_integrand_rotational_support(
-            smoothed_vtheta, smoothed_vphi, R
-        )
-        integrand_streaming = get_integrand_streaming_support(
-            smoothed_vr,
-            smoothed_vtheta,
-            smoothed_vphi,
-            smoothed_dvr_dr,
-            smoothed_dvr_dtheta_R,
-            smoothed_dvr_dphi_R_sin_theta,
-        )
+        # Ignore where we divide by zero as nansum takes care of this. SOAP throws an error otherwise.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            integrand_thermal = get_integrand_thermal_support(
+                smoothed_dP_dr, smoothed_densities
+            )
+            integrand_turbulence = get_integrand_turbulent_support(
+                smoothed_dTurbulence_dr, smoothed_densities
+            )
+            integrand_rotation = get_integrand_rotational_support(
+                smoothed_vtheta, smoothed_vphi, R
+            )
+            integrand_streaming = get_integrand_streaming_support(
+                smoothed_vr,
+                smoothed_vtheta,
+                smoothed_vphi,
+                smoothed_dvr_dr,
+                smoothed_dvr_dtheta_R,
+                smoothed_dvr_dphi_R_sin_theta,
+            )
+
+        # Get enclosed particle mass to normalize the mass terms
+        radial_classification = np.digitize(self.radius, radial_bin_centres)
+        differential_enclosed_particles = np.bincount(radial_classification, minlength = len(radial_bin_centres) + 1) # Extra bin needed
+        num_enclosed_particles = np.cumsum(differential_enclosed_particles)[:-1]
+
+        differential_mass = np.bincount(radial_classification, weights=self.mass,
+                                        minlength = len(radial_bin_centres) + 1) # Extra bin needed
+
+        # Reattach the units from the particle_masses array
+        enclosed_mass = (np.cumsum(differential_mass)[:-1] * self.mass.units).to(unyt.Msun)
 
         # HEALPix provides equal area surfaces
         area_per_angular_bin = 4 * np.pi * R**2 / number_angular_bins
 
         S_thermal = do_surface_integral(
             integrand_thermal, area_per_angular_bin
-        ).to(unyt.Msun)
+        ).to(unyt.Msun) / enclosed_mass
+        S_turbulence = do_surface_integral(
+            integrand_turbulence, area_per_angular_bin
+        ).to(unyt.Msun) / enclosed_mass
         S_rotational = do_surface_integral(
             integrand_rotation, area_per_angular_bin
-        ).to(unyt.Msun)
+        ).to(unyt.Msun) / enclosed_mass
         S_streaming = do_surface_integral(
             integrand_streaming, area_per_angular_bin
-        ).to(unyt.Msun)
+        ).to(unyt.Msun) / enclosed_mass
 
-        return S_thermal, S_rotational, S_streaming
+        # Get enclosed particle mass to normalize the mass terms
+        radial_gas_classification = np.digitize(self.radius[self.types == 0], radial_bin_centres)
+        differential_gas_mass = np.bincount(radial_gas_classification, weights=self.mass[self.types == 0],
+                                        minlength = len(radial_bin_centres) + 1) # Extra bin needed
+
+        # Reattach the units from the particle_masses array
+        enclosed_gas_mass = (np.cumsum(differential_gas_mass)[:-1] * self.mass.units).to(unyt.Msun)
+
+        return (
+            S_thermal, 
+            S_turbulence, 
+            S_rotational, 
+            S_streaming, 
+            np.nanmean(smoothed_densities.value, axis=1), 
+            enclosed_gas_mass.value,
+            np.nanmean(smoothed_dP_dr.value, axis=1),
+            num_enclosed_particles
+        )
 
     @lazy_property
     def _euler_mass_terms(self) -> Tuple:
@@ -3438,7 +3494,7 @@ class SOParticleData:
         the result as (thermal, rotational, streaming).
         """
         if self.Ngas == 0:
-            return None, None, None
+            return None, None, None, None
         return self._calculate_euler_mass_terms()
 
     @lazy_property
@@ -3450,12 +3506,20 @@ class SOParticleData:
         return self._euler_mass_terms[0]
 
     @lazy_property
+    def EulerMassTurbulentSupport(self) -> unyt.unyt_array:
+        """
+        Contribution of gas thermal support against gravitational collapse,
+        measured at two halo-centric radii.
+        """
+        return self._euler_mass_terms[1]
+
+    @lazy_property
     def EulerMassRotationalSupport(self) -> unyt.unyt_array:
         """
         Contribution of gas rotational motions against gravitational collapse,
         measured at two halo-centric radii.
         """
-        return self._euler_mass_terms[1]
+        return self._euler_mass_terms[2]
 
     @lazy_property
     def EulerMassStreamingSupport(self) -> unyt.unyt_array:
@@ -3463,7 +3527,40 @@ class SOParticleData:
         Contribution of gas streaming motions against gravitational collapse,
         measured at two halo-centric radii.
         """
-        return self._euler_mass_terms[2]
+        return self._euler_mass_terms[3]
+
+    @lazy_property
+    def TestField1(self) -> unyt.unyt_array:
+        """
+        Contribution of gas streaming motions against gravitational collapse,
+        measured at two halo-centric radii.
+        """
+        return self._euler_mass_terms[4]
+
+    @lazy_property
+    def TestField2(self) -> unyt.unyt_array:
+        """
+        Contribution of gas streaming motions against gravitational collapse,
+        measured at two halo-centric radii.
+        """
+        return self._euler_mass_terms[5]
+
+    @lazy_property
+    def TestField3(self) -> unyt.unyt_array:
+        """
+        Contribution of gas streaming motions against gravitational collapse,
+        measured at two halo-centric radii.
+        """
+        return self._euler_mass_terms[6]
+
+    @lazy_property
+    def TestField4(self) -> unyt.unyt_array:
+        """
+        Contribution of gas streaming motions against gravitational collapse,
+        measured at two halo-centric radii.
+        """
+        return self._euler_mass_terms[7]
+    
 
 class SOProperties(HaloProperty):
     """
@@ -3618,8 +3715,13 @@ class SOProperties(HaloProperty):
             "concentration_dmo_unsoft",
             "concentration_dmo_soft",
             "EulerMassThermalSupport",
+            "EulerMassTurbulentSupport",
             "EulerMassRotationalSupport",
             "EulerMassStreamingSupport",
+            "TestField1",
+            "TestField2",
+            "TestField3",
+            "TestField4"
         ]
     }
 

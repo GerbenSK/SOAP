@@ -24,13 +24,16 @@ from SOAP.property_calculation.spherical_coordinates import project_to_spherical
 #===============================================================================
 
 def get_integrand_thermal_support(dP_dr, rho):
-    return  (-4*np.pi*u.G)**(-1) * dP_dr * rho**(-1)
+    return (-4 * np.pi * u.G)**(-1) * dP_dr * rho**(-1)
+
+def get_integrand_turbulent_support(dTurbulence_dr, rho):
+    return  (-4 * np.pi * u.G)**(-1) * dTurbulence_dr * rho**(-1)
 
 def get_integrand_rotational_support(vtheta,vphi, R):
-    return  (4*np.pi*u.G)**(-1) * (vtheta**2 + vphi**2) / R
+    return  (4 * np.pi * u.G)**(-1) * (vtheta**2 + vphi**2) / R
 
 def get_integrand_streaming_support(vr, vtheta, vphi, dvr_dr, dvr_dtheta_R, dvr_dphi_R_sin_theta):
-    return  (-4*np.pi*u.G)**(-1) * ( (vr * dvr_dr) + ( vtheta*dvr_dtheta_R ) + (vphi * dvr_dphi_R_sin_theta) )
+    return  (-4 * np.pi*  u.G)**(-1) * ( (vr * dvr_dr) + (vtheta * dvr_dtheta_R) + (vphi * dvr_dphi_R_sin_theta) )
 
 def do_surface_integral(integrand, surface_element):
     return np.nansum(integrand * surface_element, axis=1)
@@ -98,7 +101,7 @@ def get_angular_bins(number_angular_bins):
     """
 
     # We import within the function because the rest of SOAP does not use it.
-    import healpy as hp
+    import healpy as hp # type: ignore 
 
     # Obtain the power factor of 2 we require to generate the healpix sphere.
     # This also checks whether the requested number of angular bins is possible
@@ -131,78 +134,88 @@ def convert1(x, dtype, depth):# found on a github page https://github.com/numba/
     return y
 
 @jit(nopython=True, fastmath=True)
-def compute_qp_sph_with_grad(x, y, z, particle_masses, particle_properties, particle_smoothing_lengths, particle_densities, neighbors, query_point):
+def compute_smoothed_field_with_gradient(particle_masses, particle_densities, particle_properties, particle_smoothing_lengths, particle_coordinates, neighbors, query_point):
     """
     Compute SPH-interpolated quantities at a query point using neighboring particles.
 
-    This function evaluates a set of scalar quantities at a given point in space. It loops over neighboring particles, whose kernel (WC2) overlap with this points in space,
+    This function evaluates a set of scalar quantities at a given point in space. 
+    It loops over neighboring particles, whose kernel (M5) overlap with the interpolation point in space.
+    
     Parameters
-    - SPH interpolation uses the formula:
-
-      Q_interp = Σ_j (m_j / ρ_j) * Q_j * W(|r - r_j|, h_j)
-
-      where the sum is over neighbors and `W` is the kernel function.
     ----------
-    x, y, z : array_like
-        1D arrays containing the x, y, and z coordinates of all particles.
     particle_masses: np.ndarray
-        Masses of the particles whose mass profile we are interested in.
-    particle_properties : tuple of .
-        Tuple of 1D arrays, each representing a scalar field (e.g., density, pressure, velocity components)
-        defined on the particles. Each Q[i][j] corresponds to the value of the i-th field on the j-th particle.
-    particle_smoothing_lengths : array_like
-        Smoothning lengths of the particles whose mass profile we are interested in.
-    particle_densities : ndarray
-        Densities of the particles whose mass profile we are interested in.
+        Masses of the particles.
+    particle_densities: np.ndarray
+        Densities of the particles.
+    particle_properties : tuple of np.ndarray
+        Tuple of 1D arrays, each representing a scalar field (e.g., pressure, velocity components)
+        defined on the particles. Each particle_properties[i][j] corresponds to the value of the i-th field on the j-th particle.
+    particle_smoothing_lengths : np.ndarray
+        Smoothing lengths of the particles.
+    particle_coordinates : np.ndarray
+        Coordinates of the particles.
     neighbors : List (numba list)
-        List of indices of neighboring particles that lie within the search radius (maximum particle h).
-    query_point : ndarray
+        List of indices of neighboring particles that lie within the search radius (maximum particle smoothing length).
+    query_point : np.ndarray
         1D array of shape (3,) representing the 3D Cartesian coordinate of the query point where the SPH quantities
         are to be interpolated.
 
     Returns
     -------
-    sum_w_Q: np.array with shape (N_quantities)
-        representing Σ_j (m_j / ρ_j) * Q_j * W(|r - r_j|, h_j)
-        saved per quantity
-    sum_Gw_Q: np.array with shape (N_quantities, 3)
-        representing Σ_j (m_j / ρ_j) * Q_j * ∇W(|r - r_j|, h_j)
-        saved per quantity, in cartesian system!
-    sum_w: np.array with shape (1)
-        representing Σ_j (m_j / ρ_j) * W(|r - r_j|, h_j)
-    sum_Gw: np.array with shape (3)
-        representing Σ_j (m_j / ρ_j) * ∇W(|r - r_j|, h_j)
+    smoothed_density : float
+        Smoothed density at the query point.
+    smoothed_fields : np.ndarray
+        1D array of shape (num_properties,) containing the smoothed values of each quantity at the query point.
+    smoothed_field_gradients : np.ndarray
+        2D array of shape (num_properties, 3) containing the smoothed gradients of each quantity at the query point.
+    quantity_prefactor_sum : float
+        Sum of the prefactors (m_j / ρ_j) * W(|r - r_j|, h_j) for all neighboring particles, used for normalization.
+    gradient_prefactor_sum : np.ndarray
+        1D array of shape (3,) containing the sum of the gradient prefactors (m_j / ρ_j) * ∇W(|r - r_j|, h_j) for all neighboring particles, used for normalization.
+    position_difference_matrix : np.ndarray
+        2D array of shape (3, 3) representing the sum of the outer products of the position differences (r - r_j) weighted by the gradient prefactors, 
+        used for computing the smoothed gradients in Cartesian coordinates.
     """
 
-    # Arrays to hold smoothed properties.
-    sum_w_Q  = np.zeros((len(particle_properties)))
-    sum_w    = np.zeros((1))
+    # Arrays to hold smoothed properties and gradients.
+    num_properties = len(particle_properties)
+    smoothed_density = np.float64(0.0)
+    smoothed_fields = np.zeros(num_properties, dtype=np.float64)
+    smoothed_field_gradients = np.zeros((num_properties, 3), dtype=np.float64)
+    quantity_prefactor_sum = np.float64(0.0)
+    gradient_prefactor_sum = np.zeros(3, dtype=np.float64)
 
-    # Arrays to hold smoothed gradients.
-    sum_Gw_Q = np.zeros((len(particle_properties), 3) )
-    sum_Gw   = np.zeros((3))
+    position_difference_matrix = np.zeros((3, 3), dtype=np.float64)
 
-    for particle_index in neighbors:
+    for p_idx in neighbors: # Jit does not accept vectorized operations, so we split each axis up. 
+        dx, dy, dz = (
+            query_point[0] - particle_coordinates[p_idx, 0], 
+            query_point[1] - particle_coordinates[p_idx, 1], 
+            query_point[2] - particle_coordinates[p_idx, 2]
+        )
+        radius = sqrt(dx*dx + dy*dy + dz*dz)
 
-        # Distance between query point and neighbour.
-        dx = query_point[0] - x[particle_index]
-        dy = query_point[1] - y[particle_index]
-        dz = query_point[2] - z[particle_index]
-        r  = sqrt(dx*dx + dy*dy + dz*dz)
+        if radius < particle_smoothing_lengths[p_idx]:
+            kernel = kernel_M5(radius, particle_smoothing_lengths[p_idx])
+            kernel_derivative = np.array([dx, dy, dz]) * kernel_derivative_M5(radius, particle_smoothing_lengths[p_idx]) # Add the factor (x - x_p) afterwards as jit otherwise complains
 
-        # The kernel will evalutate to zero if distance is larger than smoothing length.
-        quantity_prefactor = (particle_masses[particle_index] / particle_densities[particle_index]) * kernel_M5(r, particle_smoothing_lengths[particle_index])
-        gradient_prefactor = (particle_masses[particle_index] / particle_densities[particle_index]) * kernel_derivative_M5(r, particle_smoothing_lengths[particle_index])
+            quantity_prefactor = (particle_masses[p_idx] / particle_densities[p_idx]) * kernel
+            gradient_prefactor = (particle_masses[p_idx] / particle_densities[p_idx]) * kernel_derivative
 
-        sum_w  += quantity_prefactor
-        sum_Gw += gradient_prefactor
-        for property_index in range(len(particle_properties)):
-            sum_w_Q [property_index]    += quantity_prefactor * particle_properties[property_index][particle_index]
-            sum_Gw_Q[property_index, :] += gradient_prefactor * particle_properties[property_index][particle_index]
+            # Update saved prefactors and density
+            smoothed_density += particle_masses[p_idx] * kernel
+            quantity_prefactor_sum += quantity_prefactor
+            gradient_prefactor_sum += gradient_prefactor
+            position_difference_matrix -= gradient_prefactor[:, None] * np.array([dx, dy, dz])[None, :]
 
-    return sum_w_Q, sum_Gw_Q, sum_w, sum_Gw
+            for property_index in range(num_properties): # Add the contribution of each particle to the smoothed fields and gradient fields
+                smoothed_fields[property_index] += quantity_prefactor * particle_properties[property_index][p_idx]
+                smoothed_field_gradients[property_index, :] += gradient_prefactor * particle_properties[property_index][p_idx]
 
-def get_sph_quantities_with_grad(tree, particle_coordinates, particle_masses, particle_properties, particle_smoothing_lengths, particle_densities, query_points):
+    return smoothed_density, smoothed_fields, smoothed_field_gradients, quantity_prefactor_sum, gradient_prefactor_sum, position_difference_matrix
+
+
+def get_sph_quantities_with_gradient(tree, particle_coordinates, particle_densities, particle_masses, particle_smoothing_lengths, particle_properties, query_points):
     """
     Compute SPH-interpolated quantities and gradient at a query point using
     neighboring particles.
@@ -213,55 +226,82 @@ def get_sph_quantities_with_grad(tree, particle_coordinates, particle_masses, pa
         KDTree built from particle coordinates for fast neighbor searching.
     particle_coordinates: np.ndarray
         Coordinates of the gas particles.
+    particle_densities: np.ndarray
+        Densities of the gas particles.
     particle_masses: np.ndarray
         Masses of the gas particles.
+    particle_smoothing_lengths : np.ndarray
+        Smoothing lengths of the gas particles.
     particle_properties: tuple of np.ndarray .
-        Tuple of 1D arrays, each representing a scalar property (e.g., density,
-        pressure, a given velocity component, etc.) associated to each gas particle.
+        Tuple of 1D arrays, each representing a scalar property (e.g., pressure, 
+        a given velocity component, etc.) associated to each gas particle.
         The array particle_properties[i][j] corresponds to the value of the i-th
         field on the j-th particle.
-    particle_smoothing_lengths : array_like
-        Smoothing lengths of the gas particles.
-    particle_densities : ndarray
-        Densities of the particles whose mass profile we are interested in.
-    query_points : ndarray
+    query_points : np.ndarray
         2D array of shape (N_query, 3,) representing the 3D Cartesian coordinate
         of every query point where the SPH quantities are to be calculated.
 
     Returns
     -------
-    sum_w_Q  : np.array with shape (N_query, N_quantities)
+    smoothed_density : np.array with shape (N_query,)
+        Smoothed density for every point in space
+    smoothed_fields : np.array with shape (N_query, N_quantities)
         Smoothed values of each quantity for every point in space
-    SPH_Q_grad_spherical : np.array with shape (N_query, N_quantities, 3)
-        Smoothed values of each gradient for each quantity for every point in space
-
+    smoothed_field_gradients_spherical : np.array with shape (N_query, N_quantities, 3)
+        Smoothed values of each gradient for each quantity for every point in space, projected to spherical coordinates
     """
+    num_query_points, num_properties = len(query_points), len(particle_properties)
 
-    query_points = np.asarray(query_points, dtype=np.float64)  #Jit did weird. might not need this
+    smoothed_density = np.zeros(num_query_points, dtype=np.float64)
+    smoothed_fields = np.zeros((num_query_points, num_properties), dtype=np.float64)
+    smoothed_field_gradients = np.zeros((num_query_points, num_properties, 3), dtype=np.float64)
+    quantity_prefactor_sum = np.zeros(num_query_points, dtype=np.float64)
+    gradient_prefactor_sum = np.zeros((num_query_points, 3), dtype=np.float64)
+    position_difference_matrix = np.zeros((num_query_points, 3, 3), dtype=np.float64)
 
-    sum_w_Q  = np.zeros((len(query_points), len(particle_properties)), dtype=np.float64)
-    sum_Gw_Q = np.zeros((len(query_points), len(particle_properties), 3), dtype=np.float64)
-    sum_Gw   = np.zeros((len(query_points), 3), dtype=np.float64)
-    sum_w    = np.zeros((len(query_points)), dtype=np.float64)
+    neighbor_indices = tree.query_ball_point(query_points, r=np.max(particle_smoothing_lengths), workers=1) # Includes too many points on purpose, these are filtered later on
+    neighbor_indices = convert1(neighbor_indices, dtype=np.int64, depth=1)
 
-    x, y, z = particle_coordinates[:, 0], particle_coordinates[:, 1], particle_coordinates[:, 2]
-    tmp_neighbors = tree.query_ball_point(query_points, r=np.max(particle_smoothing_lengths),workers=1)
+    for i, neighbors_query_point in enumerate(neighbor_indices):
+            (   
+            smoothed_density[i], 
+            smoothed_fields[i, :], 
+            smoothed_field_gradients[i, :, :], 
+            quantity_prefactor_sum[i], 
+            gradient_prefactor_sum[i, :],
+            position_difference_matrix[i, : ,:]
+        ) = compute_smoothed_field_with_gradient(particle_masses, 
+                                                 particle_densities, 
+                                                 particle_properties, 
+                                                 particle_smoothing_lengths, 
+                                                 particle_coordinates, 
+                                                 neighbors_query_point, 
+                                                 query_points[i])
 
-    neighbors_numba = List()
-    neighbors_numba = convert1(tmp_neighbors, dtype=np.int64, depth=1) # found on a github page https://github.com/numba/numba/issues/7727
-    for i, neighbors_qp in enumerate(neighbors_numba):
-        sum_w_Q[i, :], sum_Gw_Q[i, :, :], sum_w[i], sum_Gw[i,:] = compute_qp_sph_with_grad(x, y, z, particle_masses, particle_properties, particle_smoothing_lengths, particle_densities, neighbors_qp, query_points[i])
+    ### Method 1: Our old method using the quotient rule, which is numerically unstable when the matrix is singular.
+    # with np.errstate(divide="ignore", invalid="ignore"):
+    #     smoothed_density /= quantity_prefactor_sum
+    #     smoothed_fields /= quantity_prefactor_sum[:, None]
+    #     # Old method using quotient rule
+    #     smoothed_field_gradients_cartesian = (
+    #         smoothed_field_gradients - smoothed_fields[:, :, None] * gradient_prefactor_sum[:, None, :]
+    #     ) / quantity_prefactor_sum[:, None, None]
 
-    # Query points with no gas neighbours have sum_w == 0. The resulting 0/0 is a
-    # NaN by design (do_surface_integral uses np.nansum to drop those points), so
-    # suppress the divide warning/error that SOAP's global np.seterr would raise.
+    ### Method 2: New method using first order Taylor expansion and SVD to find the inverse of the singular matrix
     with np.errstate(divide="ignore", invalid="ignore"):
-        SPH_Q_grad_car = (sum_Gw_Q * sum_w[:, None, None] -  sum_w_Q[:, :, None] * sum_Gw[:, None, :]) / (sum_w[:, None, None])**2
-        sum_w_Q /= sum_w[:, None]
+        smoothed_density /= quantity_prefactor_sum
+        smoothed_fields /= quantity_prefactor_sum[:, None]
+        difference_term = smoothed_field_gradients - smoothed_fields[:, :, None] * gradient_prefactor_sum[:, None, :]
+        smoothed_field_gradients_cartesian = np.einsum('nlm,nqm->nql', np.linalg.pinv(position_difference_matrix), difference_term)
 
-    SPH_Q_grad_spherical = project_to_spherical_components(SPH_Q_grad_car, query_points)
+    ### Method 3: SPH swift method, without weightin.
+    # smoothed_field_gradients_cartesian = smoothed_field_gradients
 
-    return sum_w_Q, SPH_Q_grad_spherical
+    # For any of the three methods, we need to project the gradients to spherical coordinates.
+    smoothed_field_gradients_spherical = project_to_spherical_components(smoothed_field_gradients_cartesian, query_points) 
+
+    return smoothed_density, smoothed_fields, smoothed_field_gradients_spherical
+
 
 # Taken from Dehnen & Aly (2012), for a quartic spline kernel (used in COLIBRE)
 kernel_gamma_M5 = 2.018932
@@ -282,15 +322,12 @@ def kernel_M5(r: float | np.float32, H: float | np.float32) -> float:
 
     Returns
     -------
-    float
-        Contribution to density by particle at distance `r`.
+    kernel : float
+        Contribution to interpolation by particle at distance `r`.
 
     """
     inverse_H = 1.0 / H
     ratio = r * inverse_H
-
-    if ratio > 1.0:
-        return 0
 
     kernel = max((1 - ratio), 0.0)**4 - 5 * max((3/5 - ratio), 0.0)**4 + 10 * max((1/5 - ratio), 0.0)**4
     kernel *= kernel_constant_M5 * inverse_H**3
@@ -304,6 +341,9 @@ def kernel_derivative_M5(r: float | np.float32, H: float | np.float32) -> float:
 
     Parameters
     ----------
+    coord : float or np.float32
+        xi - x; 1D distance from particle to interpolation point
+    
     r : float or np.float32
         Distance from particle.
 
@@ -312,17 +352,17 @@ def kernel_derivative_M5(r: float | np.float32, H: float | np.float32) -> float:
 
     Returns
     -------
-    float
-        Contribution to density by particle at distance `r`.
+    kernel : float
+        Contribution to interpolation by particle at distance `r`.
 
     """
     inverse_H = 1.0 / H
     ratio = r * inverse_H
 
-    if ratio > 1.0:
+    if r == 0:
         return 0
 
     kernel = - 4 * max((1 - ratio), 0.0)**3 + 20 * max((3/5 - ratio), 0.0)**3 - 40 * max((1/5 - ratio), 0.0)**3
-    kernel *= kernel_constant_M5 * inverse_H**4
+    kernel *= (kernel_constant_M5 * inverse_H**4 / r)
 
     return kernel
