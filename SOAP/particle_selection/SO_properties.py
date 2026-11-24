@@ -45,7 +45,8 @@ from SOAP.property_calculation.euler_mass_terms import (
     get_integrand_turbulent_support,
     get_integrand_rotational_support,
     get_integrand_streaming_support,
-    do_surface_integral)
+    do_surface_integral,
+    kernel_gamma_M5)
 
 from SOAP.property_calculation.spherical_coordinates import cartesian_to_spherical_system
 from SOAP.property_calculation.inertia_tensors import get_inertia_tensor_mass_weighted
@@ -3244,6 +3245,26 @@ class SOParticleData:
             "momentum", Tmin=Tmin
         )
 
+    @lazy_property
+    def _euler_gas_mask(self):
+        # Full arrays, not split based on SO
+        pos = self.get_dataset("PartType0/Coordinates") - self.centre[None, :]
+        h = self.get_dataset("PartType0/SmoothingLengths")
+        
+        # Would love to not compute it again, but above it is not saved untruncated :(
+        r2 = (pos**2).sum(axis=1)
+
+        R_max = 1.2 * self.SO_r  # outer_radius * SO_r (NEEDS TO BE CONSISTENT WITH BELOW!!!)
+
+        R_extend = (R_max + kernel_gamma_M5 * h.max()) # rescale with gamma!
+        R_extend_2 = R_extend * R_extend
+        
+        if R_extend > self.search_radius:
+            raise SearchRadiusTooSmallError("Might not load all particle!!! (R > search_radius)")
+
+        # Compare the squared values to mask all required particles!
+        return r2 < R_extend_2
+    
     def _calculate_euler_mass_terms(
         self,
         inner_radius=0.01,
@@ -3308,37 +3329,69 @@ class SOParticleData:
         # The spherical coordinates/velocities are returned as lists so that units
         # can be propagated in the radial direction.
         #===========================================================================
-        gas_coordinates = self.gas_pos
+        
+        # gas_coordinates = self.gas_pos
+        # gas_velocities = (
+        #     self.gas_vel - self.vcom[None, :] + gas_coordinates * self.cosmology["H"]
+        # )
+        # _, gas_spherical_velocities = cartesian_to_spherical_system(
+        #     gas_coordinates, gas_velocities
+        # )
+        # gas_masses = self.gas_masses.to(unyt.Msun)
+        # gas_smoothing_lengths = self.gas_smoothing_lengths.to(unyt.Mpc)
+        # gas_P_therm = self.gas_pressures.to(
+        #     unyt.kg * unyt.Mpc ** (-1) * unyt.s ** (-2)
+        # )
+        # gas_densities = self.gas_densities.to(unyt.Msun * unyt.Mpc ** (-3))
+        # gas_P_turb = (gas_densities * self.gas_vel_dispersion).to( # Velocity dispersions are already squared
+        #     unyt.kg * unyt.Mpc ** (-1) * unyt.s ** (-2)
+        # )
+        # gas_temperatures = (self.gas_temperatures).to( 
+        #             unyt.K
+        #         )
+
+
+        # Include gas beyond the SO radius
+        # when evaluating the outer shells as kernel support is still there
+        
+        # Mask includes particles up untill the final radius + larges smoothening length
+        # Take value as should be bolean!
+
+        euler_sel_mask = self._euler_gas_mask.astype(bool)
+        gas_coordinates = self.get_dataset(f"PartType0/Coordinates")[euler_sel_mask] - self.centre[None, :]
         gas_velocities = (
-            self.gas_vel - self.vcom[None, :] + gas_coordinates * self.cosmology["H"]
+            self.get_dataset("PartType0/Velocities")[euler_sel_mask] - self.vcom[None, :] + gas_coordinates * self.cosmology["H"]
         )
         _, gas_spherical_velocities = cartesian_to_spherical_system(
             gas_coordinates, gas_velocities
         )
-
-        # NOTE: gas outside the spherical overdensity has already been removed by the
-        # SO particle selection. TODO: optionally include gas beyond the SO radius
-        # when evaluating the outer shells.
 
         #===========================================================================
         # Conversion to appropriate units. We work on copies so that the cached
         # lazy properties (self.gas_*) keep their original units for other
         # calculations on the same halo.
         #===========================================================================
+        gas_masses = self.get_dataset("PartType0/Masses")[euler_sel_mask].to(unyt.Msun)
+
         gas_coordinates = gas_coordinates.to(unyt.Mpc)
-        gas_smoothing_lengths = self.gas_smoothing_lengths.to(unyt.Mpc)
-        gas_masses = self.gas_masses.to(unyt.Msun)
+
+        # oh my this kernel_gamma_M5 is useful...
+        gas_smoothing_lengths = kernel_gamma_M5 * self.get_dataset(f"PartType0/SmoothingLengths")[euler_sel_mask].to(unyt.Mpc) 
+        
         gas_spherical_velocities = [
             velocity.to(unyt.km / unyt.s) for velocity in gas_spherical_velocities
         ]
-        gas_pressures = self.gas_pressures.to(
-            unyt.kg * unyt.Mpc ** (-1) * unyt.s ** (-2)
-        )
-        gas_densities = self.gas_densities.to(unyt.Msun * unyt.Mpc ** (-3))
-        gas_turbulence = (gas_densities * self.gas_vel_dispersion).to( # Velocity dispersions are already squared
-            unyt.kg * unyt.Mpc ** (-1) * unyt.s ** (-2)
-        )
-
+        gas_P_therm = self.get_dataset(f"PartType0/Pressures")[euler_sel_mask].to(
+                    unyt.kg * unyt.Mpc ** (-1) * unyt.s ** (-2)
+                )
+        gas_densities = self.get_dataset(f"PartType0/Densities")[euler_sel_mask].to(unyt.Msun * unyt.Mpc ** (-3))
+        gas_P_turb = (gas_densities * self.get_dataset(f"PartType0/VelocityDispersions")[euler_sel_mask]).to( # Velocity dispersions are already squared
+                    unyt.kg * unyt.Mpc ** (-1) * unyt.s ** (-2)
+                )
+        
+        gas_temperatures = self.get_dataset(f"PartType0/Temperatures")[euler_sel_mask].to( 
+                            unyt.K
+                        )
         #===========================================================================
         # Do SPH-smoothing for quantities relevant to the EM-terms.
         #===========================================================================
@@ -3348,11 +3401,12 @@ class SOParticleData:
 
         # Pack together all required gas properties we need to smooth.
         properties_to_smooth = (
-            gas_pressures,
-            gas_turbulence,
+            gas_P_therm,
+            gas_P_turb,
             gas_spherical_velocities[0],
             gas_spherical_velocities[1],
             gas_spherical_velocities[2],
+            gas_temperatures,
         )
         number_of_quantities = len(properties_to_smooth)
         properties_to_smooth = tuple(
@@ -3360,7 +3414,7 @@ class SOParticleData:
         )
 
         # Smooth quantities, which will return the results as (N_query, N_quantities) shape.
-        smoothed_densities, smoothed_values, smoothed_spherical_gradients = get_sph_quantities_with_gradient(
+        smoothed_densities_sv, smoothed_values_sv, smoothed_spherical_gradients_sv = get_sph_quantities_with_gradient(
             gas_tree,
             gas_coordinates,
             gas_densities,
@@ -3371,33 +3425,37 @@ class SOParticleData:
         )
 
         # Reshape to get back to the original radial decomposition shape.
-        smoothed_densities = smoothed_densities.reshape(
+        smoothed_densities = smoothed_densities_sv.reshape(
             number_radial_bins, number_angular_bins
         )
-        smoothed_values = smoothed_values.reshape(
+        smoothed_values = smoothed_values_sv.reshape(
             number_radial_bins, number_angular_bins, number_of_quantities
         )
-        smoothed_spherical_gradients = smoothed_spherical_gradients.reshape(
+        smoothed_spherical_gradients = smoothed_spherical_gradients_sv.reshape(
             number_radial_bins, number_angular_bins, number_of_quantities, 3
         )
 
         # Add back the units, which are lost within jit.
         smoothed_densities *= gas_densities.units
-        smoothed_pressures = smoothed_values[:, :, 0] * gas_pressures.units
+        smoothed_P_therm = smoothed_values[:, :, 0] * gas_P_therm.units
+        smoothed_P_turb = smoothed_values[:, :, 1] * gas_P_therm.units
+
         smoothed_vr = smoothed_values[:, :, 2] * gas_spherical_velocities[0].units
         smoothed_vtheta = smoothed_values[:, :, 3] * gas_spherical_velocities[1].units
         smoothed_vphi = smoothed_values[:, :, 4] * gas_spherical_velocities[2].units
+        
+        smoothed_temperatures =  smoothed_values[:, :, 5] * gas_temperatures.units
 
         # The angular derivatives already include 1/R and 1/Rsin(theta) hence we only
         # need units for the radial dimension.
-        smoothed_dP_dr = (
+        smoothed_dPtherm_dr = (
             smoothed_spherical_gradients[:, :, 0, 0]
-            * gas_pressures.units
+            * gas_P_therm.units
             / radial_bin_centres.units
         )
-        smoothed_dTurbulence_dr = (
+        smoothed_dPturb_dr = (
             smoothed_spherical_gradients[:, :, 1, 0]
-            * gas_turbulence.units
+            * gas_P_turb.units
             / radial_bin_centres.units
         )
         smoothed_dvr_dr = (
@@ -3424,10 +3482,10 @@ class SOParticleData:
         # Ignore where we divide by zero as nansum takes care of this. SOAP throws an error otherwise.
         with np.errstate(divide="ignore", invalid="ignore"):
             integrand_thermal = get_integrand_thermal_support(
-                smoothed_dP_dr, smoothed_densities
+                smoothed_dPtherm_dr, smoothed_densities
             )
             integrand_turbulence = get_integrand_turbulent_support(
-                smoothed_dTurbulence_dr, smoothed_densities
+                smoothed_dPturb_dr, smoothed_densities
             )
             integrand_rotation = get_integrand_rotational_support(
                 smoothed_vtheta, smoothed_vphi, R
@@ -3475,16 +3533,18 @@ class SOParticleData:
 
         # Reattach the units from the particle_masses array
         enclosed_gas_mass = (np.cumsum(differential_gas_mass)[:-1] * self.mass.units).to(unyt.Msun)
-
         return (
             S_thermal, 
             S_turbulence, 
             S_rotational, 
             S_streaming, 
-            np.nanmean(smoothed_densities.value, axis=1), 
-            enclosed_gas_mass.value,
-            np.nanmean(smoothed_dP_dr.value, axis=1),
-            num_enclosed_particles
+            smoothed_densities_sv.flatten(),
+            smoothed_values_sv.flatten(),
+            smoothed_spherical_gradients_sv.flatten(),
+            np.nanmean(smoothed_densities.value, axis=1),
+            # np.nanmean(smoothed_temperatures.value, axis=1),
+            # np.nanmean(smoothed_P_turb.value, axis=1),
+            # np.nanmean(smoothed_P_therm.value, axis=1),
         )
 
     @lazy_property

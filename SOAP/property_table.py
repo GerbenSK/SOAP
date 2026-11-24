@@ -1247,7 +1247,7 @@ class PropertyTable:
         ),
         "TestField1": Property(
             name="TestField1",
-            shape=300,
+            shape=300*300,
             dtype=np.float32,
             unit="dimensionless",
             description="Output field for testing",
@@ -1266,7 +1266,7 @@ class PropertyTable:
         ),
         "TestField2": Property(
             name="TestField2",
-            shape=300,
+            shape=300*300*6,
             dtype=np.float32,
             unit="dimensionless",
             description="Output field for testing",
@@ -1285,7 +1285,7 @@ class PropertyTable:
         ),
         "TestField3": Property(
             name="TestField3",
-            shape=300,
+            shape=300*300*6*3,
             dtype=np.float32,
             unit="dimensionless",
             description="Output field for testing",

@@ -288,14 +288,14 @@ def get_sph_quantities_with_gradient(tree, particle_coordinates, particle_densit
     #     ) / quantity_prefactor_sum[:, None, None]
 
     ### Method 2: New method using first order Taylor expansion and SVD to find the inverse of the singular matrix
-    with np.errstate(divide="ignore", invalid="ignore"):
-        smoothed_density /= quantity_prefactor_sum
-        smoothed_fields /= quantity_prefactor_sum[:, None]
-        difference_term = smoothed_field_gradients - smoothed_fields[:, :, None] * gradient_prefactor_sum[:, None, :]
-        smoothed_field_gradients_cartesian = np.einsum('nlm,nqm->nql', np.linalg.pinv(position_difference_matrix), difference_term)
+    # with np.errstate(divide="ignore", invalid="ignore"):
+    #     smoothed_density /= quantity_prefactor_sum
+    #     smoothed_fields /= quantity_prefactor_sum[:, None]
+    #     difference_term = smoothed_field_gradients - smoothed_fields[:, :, None] * gradient_prefactor_sum[:, None, :]
+    #     smoothed_field_gradients_cartesian = np.einsum('nlm,nqm->nql', np.linalg.pinv(position_difference_matrix), difference_term)
 
     ### Method 3: SPH swift method, without weightin.
-    # smoothed_field_gradients_cartesian = smoothed_field_gradients
+    smoothed_field_gradients_cartesian = smoothed_field_gradients
 
     # For any of the three methods, we need to project the gradients to spherical coordinates.
     smoothed_field_gradients_spherical = project_to_spherical_components(smoothed_field_gradients_cartesian, query_points) 
