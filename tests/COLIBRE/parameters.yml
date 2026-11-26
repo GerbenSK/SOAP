@@ -1,7 +1,7 @@
 # Values in this section are substituted into the other sections
 Parameters:
   sim_dir: /net/hypernova/data2/COLIBRE
-  output_dir: test_output
+  output_dir: test_output/convergence
   scratch_dir: test_output
 
 # Location of the Swift snapshots:

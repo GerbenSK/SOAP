@@ -42,6 +42,8 @@ SOProperties:
     TestField2: true  # Requires numba and healpy
     TestField3: true  # Requires numba and healpy
     TestField4: true  # Requires numba and healpy
+    TestField5: true  # Requires numba and healpy
+    TestField6: true  # Requires numba and healpy
     SORadius: true
     TotalMass: true
   variations:

@@ -45,7 +45,9 @@ from SOAP.property_calculation.euler_mass_terms import (
     get_integrand_turbulent_support,
     get_integrand_rotational_support,
     get_integrand_streaming_support,
-    do_surface_integral)
+    do_surface_integral,
+    kernel_gamma_M5
+)
 
 from SOAP.property_calculation.spherical_coordinates import cartesian_to_spherical_system
 from SOAP.property_calculation.inertia_tensors import get_inertia_tensor_mass_weighted
@@ -494,14 +496,15 @@ class SOParticleData:
                     self.dm_missed_mass = m2 * (self.SO_r - r1) / (r2 - r1)
 
             # Removing particles outside SO radius
-            self.all_selection = self.radius < self.SO_r
-            self.gas_selection = self.radius[self.types == 0] < self.SO_r
+            self.all_selection = self.radius < 1.3 * self.SO_r
+            self.gas_selection = self.radius[self.types == 0] < 1.3 * self.SO_r
             self.dm_selection = self.radius[self.types == 1] < self.SO_r
             self.star_selection = self.radius[self.types == 4] < self.SO_r
             self.bh_selection = self.radius[self.types == 5] < self.SO_r
 
             # Save particles outside SO radius for inertia tensor calculations
             self.surrounding_mass = self.mass[np.logical_not(self.all_selection)]
+            # self.surrounding_velocity = self.velocity[np.logical_not(self.all_selection)]
             self.surrounding_position = self.position[
                 np.logical_not(self.all_selection)
             ]
@@ -2281,6 +2284,27 @@ class SOParticleData:
         return etherm_gas.sum()
 
     @lazy_property
+    def NonThermalEnergyGas(self) -> unyt.unyt_array:
+        """
+        Total thermal energy of gas particles.
+
+        While this could be computed from PartType0/InternalEnergies, we use
+        the equation of state
+            P = (gamma-1) * rho * u
+        (with gamma=4/3) because some simulations (read: FLAMINGO) do not output
+        the internal energies.
+        """
+        if self.Ngas == 0:
+            return None
+        enontherm_gas = (
+            3
+            * self.gas_masses
+            * self.get_dataset("PartType0/NonThermalPressures")[self.gas_selection]
+            / self.gas_densities
+        )
+        return enontherm_gas.sum()
+
+    @lazy_property
     def DopplerB(self) -> unyt.unyt_quantity:
         """
         Total Doppler B of gas in the spherical overdensity.
@@ -3248,8 +3272,8 @@ class SOParticleData:
         self,
         inner_radius=0.01,
         outer_radius=1.2,
-        number_radial_bins=300,
-        number_angular_bins=12*5**2,
+        number_radial_bins=20,
+        number_angular_bins=12*4**2,
     ):
         """
         Returns the values of all the Euler mass terms for a halo as a function of
@@ -3309,6 +3333,14 @@ class SOParticleData:
         # can be propagated in the radial direction.
         #===========================================================================
         gas_coordinates = self.gas_pos
+        # gas_coordinates = np.concatenate(
+        #     [self.gas_pos, self.surrounding_position[self.surrounding_types == 0]], 
+        #     axis=0
+        # )
+        # gas_velocities = np.concatenate(
+        #     [self.gas_vel, self.surrounding_velocity[self.surrounding_types == 0]],
+        #     axis=0
+        # )
         gas_velocities = (
             self.gas_vel - self.vcom[None, :] + gas_coordinates * self.cosmology["H"]
         )
@@ -3320,13 +3352,21 @@ class SOParticleData:
         # SO particle selection. TODO: optionally include gas beyond the SO radius
         # when evaluating the outer shells.
 
+        # Check if we have loaded enough particles
+        # if np.max(gas_spherical_coordinates[0].to(unyt.Mpc)) < 1.1 * outer_radius * self.SO_r:
+            # raise SearchRadiusTooSmallError("Euler mass terms required more particles")
+        # radial_mask = (gas_spherical_coordinates[0].to(unyt.Mpc) < 1.1 * outer_radius * self.SO_r)
         #===========================================================================
         # Conversion to appropriate units. We work on copies so that the cached
         # lazy properties (self.gas_*) keep their original units for other
         # calculations on the same halo.
         #===========================================================================
         gas_coordinates = gas_coordinates.to(unyt.Mpc)
-        gas_smoothing_lengths = self.gas_smoothing_lengths.to(unyt.Mpc)
+        gas_smoothing_lengths = self.gas_smoothing_lengths.to(unyt.Mpc) * kernel_gamma_M5
+        # gas_masses = np.concatenate(
+        #     [self.gas_masses.to(unyt.Msun), self.surrounding_mass[self.surrounding_types == 0].to(unyt.Msun)],
+        #     axis=0
+        # )
         gas_masses = self.gas_masses.to(unyt.Msun)
         gas_spherical_velocities = [
             velocity.to(unyt.km / unyt.s) for velocity in gas_spherical_velocities
@@ -3383,7 +3423,8 @@ class SOParticleData:
 
         # Add back the units, which are lost within jit.
         smoothed_densities *= gas_densities.units
-        smoothed_pressures = smoothed_values[:, :, 0] * gas_pressures.units
+        smoothed_pressure = smoothed_values[:, :, 0] * gas_pressures.units
+        smoothed_turbulence = smoothed_values[:, :, 1] * gas_turbulence.units
         smoothed_vr = smoothed_values[:, :, 2] * gas_spherical_velocities[0].units
         smoothed_vtheta = smoothed_values[:, :, 3] * gas_spherical_velocities[1].units
         smoothed_vphi = smoothed_values[:, :, 4] * gas_spherical_velocities[2].units
@@ -3444,7 +3485,7 @@ class SOParticleData:
         # Get enclosed particle mass to normalize the mass terms
         radial_classification = np.digitize(self.radius, radial_bin_centres)
         differential_enclosed_particles = np.bincount(radial_classification, minlength = len(radial_bin_centres) + 1) # Extra bin needed
-        num_enclosed_particles = np.cumsum(differential_enclosed_particles)[:-1]
+        # num_enclosed_particles = np.cumsum(differential_enclosed_particles)[:-1]
 
         differential_mass = np.bincount(radial_classification, weights=self.mass,
                                         minlength = len(radial_bin_centres) + 1) # Extra bin needed
@@ -3468,13 +3509,32 @@ class SOParticleData:
             integrand_streaming, area_per_angular_bin
         ).to(unyt.Msun) / enclosed_mass
 
-        # Get enclosed particle mass to normalize the mass terms
+
+        #======================================================
+        # Output for conservation of mass / energy information
+        #======================================================
+
+        # Output 1): enclosed gas mass
         radial_gas_classification = np.digitize(self.radius[self.types == 0], radial_bin_centres)
         differential_gas_mass = np.bincount(radial_gas_classification, weights=self.mass[self.types == 0],
-                                        minlength = len(radial_bin_centres) + 1) # Extra bin needed
+                                            minlength = len(radial_bin_centres) + 1) # Extra bin needed
+        gas_volumes = gas_masses / gas_densities
+        thermal_energy = 1.5 * gas_pressures * gas_volumes
+        turbulent_energy = 1.5 * gas_turbulence * gas_volumes
+        differential_thermal_energy = np.bincount(radial_gas_classification, weights=thermal_energy,
+                                                  minlength = len(radial_bin_centres) + 1)
+        differential_turbulent_energy = np.bincount(radial_gas_classification, weights=turbulent_energy, 
+                                                    minlength = len(radial_bin_centres) + 1)
 
         # Reattach the units from the particle_masses array
         enclosed_gas_mass = (np.cumsum(differential_gas_mass)[:-1] * self.mass.units).to(unyt.Msun)
+        enclosed_thermal_energy = (
+            np.cumsum(differential_thermal_energy)[:-1] * gas_pressures.units * gas_volumes.units
+        ).to(unyt.Msun * unyt.Mpc**2 * unyt.Gyr**(-2))
+        enclosed_turbulent_energy = (
+            np.cumsum(differential_turbulent_energy)[:-1] * gas_pressures.units * gas_volumes.units
+        ).to(unyt.Msun * unyt.Mpc**2 * unyt.Gyr**(-2))
+
 
         return (
             S_thermal, 
@@ -3482,9 +3542,11 @@ class SOParticleData:
             S_rotational, 
             S_streaming, 
             np.nanmean(smoothed_densities.value, axis=1), 
+            np.nanmean(smoothed_pressure.value, axis=1),
+            np.nanmean(smoothed_turbulence.value, axis=1),
             enclosed_gas_mass.value,
-            np.nanmean(smoothed_dP_dr.value, axis=1),
-            num_enclosed_particles
+            enclosed_thermal_energy.value,
+            enclosed_turbulent_energy.value
         )
 
     @lazy_property
@@ -3560,6 +3622,22 @@ class SOParticleData:
         measured at two halo-centric radii.
         """
         return self._euler_mass_terms[7]
+
+    @lazy_property
+    def TestField5(self) -> unyt.unyt_array:
+        """
+        Contribution of gas streaming motions against gravitational collapse,
+        measured at two halo-centric radii.
+        """
+        return self._euler_mass_terms[8]
+
+    @lazy_property
+    def TestField6(self) -> unyt.unyt_array:
+        """
+        Contribution of gas streaming motions against gravitational collapse,
+        measured at two halo-centric radii.
+        """
+        return self._euler_mass_terms[9]
     
 
 class SOProperties(HaloProperty):
@@ -3657,6 +3735,7 @@ class SOProperties(HaloProperty):
             "compY_no_agn",
             "KineticEnergyGas",
             "ThermalEnergyGas",
+            "NonThermalEnergyGas",
             "Mdm",
             "Ldm",
             "Mstar",
@@ -3721,7 +3800,9 @@ class SOProperties(HaloProperty):
             "TestField1",
             "TestField2",
             "TestField3",
-            "TestField4"
+            "TestField4",
+            "TestField5",
+            "TestField6"
         ]
     }
 
